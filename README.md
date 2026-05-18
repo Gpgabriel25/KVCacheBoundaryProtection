@@ -26,7 +26,7 @@ python3 scripts/plot_64k_position.py --preset q3-4b-2507
 python3 scripts/plot_perdomain_longctx.py
 ```
 
-Outputs land under `figures/` when run from the repository root (some scripts default to `paper/figures/`—edit `out_dir` in the script or pass the path argument where supported).
+Outputs land under `figures/` when you run commands from this repository root (paths were normalized for the public tree).
 
 ## Ethics / scope
 
