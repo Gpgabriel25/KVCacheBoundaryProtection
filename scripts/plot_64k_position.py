@@ -16,7 +16,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 DEFAULT_RESULTS_DIR = Path(__file__).resolve().parent.parent / "results" / "64k-qwen35"
-DEFAULT_OUT_DIR = Path(__file__).resolve().parent.parent / "paper" / "figures"
+DEFAULT_OUT_DIR = Path(__file__).resolve().parent.parent / "figures"
 
 
 def load_results(results_dir: Path, fname: str):

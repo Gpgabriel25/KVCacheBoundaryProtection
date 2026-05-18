@@ -19,7 +19,7 @@ import numpy as np
 
 REPO = Path(__file__).resolve().parent.parent
 RESULTS = REPO / "results" / "longctx"
-OUT = REPO / "paper" / "figures" / "fig_perdomain_longctx.pdf"
+OUT = REPO / "figures" / "fig_perdomain_longctx.pdf"
 
 # longbench-longctx.jsonl: 8 items per subtask in this order
 DOMAINS = [
