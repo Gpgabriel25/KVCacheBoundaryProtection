@@ -1,0 +1,246 @@
+# Policy definitions for CounterFact KV Eviction (N02)
+# Each entry maps a policy id (must match matrix.yaml) to its implementation params.
+
+policies:
+
+  lru:
+    display_name: "LRU"
+    description: "Least-recently-used heuristic eviction."
+    module: "counterfact_kv_eviction.policies"
+    class: "LRUPolicy"
+    params: {}
+
+  hybrid:
+    display_name: "Recency-Frequency Hybrid"
+    description: "Weighted combination of recency and access frequency scores."
+    module: "counterfact_kv_eviction.policies"
+    class: "HybridRecencyFrequencyPolicy"
+    params:
+      recency_weight: 0.6
+      frequency_weight: 0.4
+
+  attention_score:
+    display_name: "Attention-Score Heuristic"
+    description: "Evict blocks with lowest cumulative attention mass."
+    module: "counterfact_kv_eviction.policies"
+    class: "AttentionHeuristicPolicy"
+    params:
+      attention_weight: 0.6
+      staleness_weight: 0.4
+
+  causal_credits:
+    display_name: "Causal Credits (Counterfactual)"
+    description: >
+      Lightweight counterfactual utility estimator that predicts future
+      loss impact of retaining/evicting each KV block, using estimated
+      retention credit with uncertainty penalty.
+    module: "counterfact_kv_eviction.policies"
+    class: "CausalCreditsPolicy"
+    params:
+      uncertainty_penalty: 0.2
+
+  causal_no_uncertainty_penalty:
+    display_name: "Causal Credits (No Uncertainty Penalty)"
+    description: >
+      Deterministic ablation of causal credits that removes uncertainty
+      penalization from the retention-utility score.
+    module: "counterfact_kv_eviction.policies"
+    class: "CausalNoUncertaintyPenaltyPolicy"
+    params:
+      uncertainty_penalty: 0.0
+
+  causal_high_uncertainty_penalty:
+    display_name: "Causal Credits (High Uncertainty Penalty)"
+    description: >
+      Deterministic ablation of causal credits that strongly penalizes
+      uncertainty in the retention-utility score.
+    module: "counterfact_kv_eviction.policies"
+    class: "CausalHighUncertaintyPenaltyPolicy"
+    params:
+      uncertainty_penalty: 1.0
+
+  causal_recovery_all:
+    display_name: "Causal Credits (Recovery-All Guardrails)"
+    description: >
+      Causal credits policy with all stability guardrails enabled: rare-key
+      retention quota, max-evictions-per-window cap, and retrieval-anchor
+      score bonus.
+    module: "counterfact_kv_eviction.policies"
+    class: "CausalRecoveryAllPolicy"
+    params:
+      uncertainty_penalty: 0.2
+      rare_key_retention_fraction: 0.10
+      max_evictions_per_window: 64
+      eviction_window_size: 64
+      retrieval_anchor_attention_threshold: 0.75
+      retrieval_anchor_bonus: 0.35
+
+  causal_anchor_floor:
+    display_name: "Causal Credits (Anchor Pool + Recency Floor)"
+    description: >
+      Causal credits with a hard retrieval-anchor pool and a recency floor
+      that protects very recently used blocks from eviction.
+    module: "counterfact_kv_eviction.policies"
+    class: "CausalAnchorFloorPolicy"
+    params:
+      uncertainty_penalty: 0.2
+      anchor_pool_fraction: 0.10
+      anchor_attention_threshold: 0.75
+      recency_floor_steps: 32
+
+  causal_niah_guarded:
+    display_name: "Causal Credits (NIAH-Guarded)"
+    description: >
+      Retrieval-preserving causal variant for NIAH-style slices. Protects a
+      small high-attention anchor pool and rare high-attention candidates while
+      capping per-step evictions to reduce churn-induced latency spikes.
+    module: "counterfact_kv_eviction.policies"
+    class: "CausalNIAHGuardedPolicy"
+    params:
+      uncertainty_penalty: 0.2
+      anchor_pool_fraction: 0.10
+      needle_attention_threshold: 0.85
+      needle_access_ceiling: 2
+      max_evictions_per_step: 8
+
+  causal_niah_guarded_v2:
+    display_name: "Causal Credits (NIAH-Guarded v2 Redesign)"
+    description: >
+      Redesign variant of NIAH-guarded causal credits that preserves a slightly
+      broader bridge-context set (medium-attention, recently used, low-access
+      keys) to improve needle exact-match robustness while keeping the same
+      per-step eviction cap for latency stability.
+    module: "counterfact_kv_eviction.policies"
+    class: "CausalNIAHGuardedV2Policy"
+    params:
+      uncertainty_penalty: 0.2
+      anchor_pool_fraction: 0.12
+      needle_attention_threshold: 0.83
+      needle_access_ceiling: 3
+      rare_key_attention_threshold: 0.68
+      rare_key_access_ceiling: 4
+      rare_key_recent_window: 160
+      bridge_attention_threshold: 0.60
+      bridge_access_ceiling: 5
+      bridge_recent_window: 192
+      max_evictions_per_step: 8
+
+  causal_niah_retrieval_balanced:
+    display_name: "Causal Credits (NIAH Retrieval-Balanced)"
+    description: >
+      Retrieval-focused guarded variant for hard NIAH/retrieval slices.
+      Extends the V3 rare-key protections with an explicit retrieval-support
+      pool and a tighter per-step eviction cap to preserve sparse anchors while
+      controlling p99 latency spikes.
+    module: "counterfact_kv_eviction.policies"
+    class: "CausalNIAHRetrievalBalancedPolicy"
+    params:
+      uncertainty_penalty: 0.2
+      anchor_pool_fraction: 0.12
+      needle_attention_threshold: 0.80
+      needle_access_ceiling: 4
+      rare_key_attention_threshold: 0.65
+      rare_key_access_ceiling: 5
+      rare_key_recent_window: 192
+      bridge_attention_threshold: 0.58
+      bridge_access_ceiling: 6
+      bridge_recent_window: 224
+      rare_pool_fraction: 0.15
+      rare_pool_access_ceiling: 4
+      retrieval_pool_fraction: 0.12
+      retrieval_attention_threshold: 0.52
+      retrieval_access_ceiling: 7
+      retrieval_recent_window: 224
+      max_evictions_per_step: 6
+
+  causal_consensus_guarded:
+    display_name: "Causal Credits (Consensus-Guarded)"
+    description: >
+      Implementation-focused candidate that combines causal keep utility with
+      recency and heavy-hitter retention signals under the same retrieval
+      guardrails. When uncertainty is high, it shifts weight toward recency to
+      avoid fragile low-confidence evictions.
+    module: "counterfact_kv_eviction.policies"
+    class: "CausalConsensusGuardedPolicy"
+    params:
+      uncertainty_penalty: 0.2
+      anchor_pool_fraction: 0.12
+      needle_attention_threshold: 0.80
+      needle_access_ceiling: 4
+      rare_key_attention_threshold: 0.65
+      rare_key_access_ceiling: 5
+      rare_key_recent_window: 192
+      bridge_attention_threshold: 0.58
+      bridge_access_ceiling: 6
+      bridge_recent_window: 224
+      rare_pool_fraction: 0.15
+      rare_pool_access_ceiling: 4
+      retrieval_pool_fraction: 0.12
+      retrieval_attention_threshold: 0.52
+      retrieval_access_ceiling: 7
+      retrieval_recent_window: 224
+      max_evictions_per_step: 6
+      causal_keep_weight: 0.55
+      recency_keep_weight: 0.30
+      heavy_hitter_keep_weight: 0.15
+      high_uncertainty_threshold: 0.65
+      uncertainty_recency_boost: 0.35
+      recent_window: 48
+
+  causal_query_bonus:
+    display_name: "Causal Credits (Query-Match Bonus)"
+    description: >
+      Causal credits with an additive retention bonus for blocks likely to
+      match the active query context (recently accessed and high attention).
+    module: "counterfact_kv_eviction.policies"
+    class: "CausalQueryBonusPolicy"
+    params:
+      uncertainty_penalty: 0.2
+      query_recent_window: 24
+      query_attention_threshold: 0.55
+      query_match_bonus: 0.30
+
+  causal_two_stage:
+    display_name: "Causal Credits (Two-Stage Anchor-First)"
+    description: >
+      Two-stage strategy that evicts non-anchor blocks first, then applies
+      causal ranking to anchors only if additional evictions are required.
+    module: "counterfact_kv_eviction.policies"
+    class: "CausalTwoStagePolicy"
+    params:
+      uncertainty_penalty: 0.2
+      anchor_pool_fraction: 0.10
+      anchor_attention_threshold: 0.75
+
+  h2o_like:
+    display_name: "H2O-Like Heavy-Hitter Baseline"
+    description: >
+      Prior-art-inspired heuristic baseline that favors retaining frequent
+      and recent blocks. This is a simplified heavy-hitter style approximation,
+      not an implementation of the original H2O method.
+    module: "counterfact_kv_eviction.policies"
+    class: "HeavyHitterH2OLikePolicy"
+    params:
+      heavy_hitter_weight: 0.7
+      attention_weight: 0.1
+      recent_window: 64
+      recent_bonus: 1.0
+
+  streaming_sink_like:
+    display_name: "Streaming-Sink-Like Baseline"
+    description: >
+      Prior-art-inspired baseline that reserves an early sink-token region and
+      a small recent window before evicting older non-protected entries.
+      This is a simplified approximation, not the original StreamingLLM method.
+    module: "counterfact_kv_eviction.policies"
+    class: "StreamingSinkLikePolicy"
+    params:
+      sink_size: 4
+      recent_window_size: 8
+
+# ---------------------------------------------------------------------------
+# Guard-rail defaults (apply to all policies unless overridden)
+# ---------------------------------------------------------------------------
+guardrails:
+  max_evictions_per_window: 64
+  minimum_recency_retention_fraction: 0.10

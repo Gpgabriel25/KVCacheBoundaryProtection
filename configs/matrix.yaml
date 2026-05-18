@@ -1,0 +1,149 @@
+# Experiment matrix for CounterFact KV Eviction (N02)
+# Source-of-truth for all experiment sweeps.
+# Do NOT modify individual fields without updating configs/policies.yaml and the runner scripts.
+
+experiment_name: "counterfact_kv_eviction"
+
+# ---------------------------------------------------------------------------
+# Policies
+# ---------------------------------------------------------------------------
+policies:
+  - lru
+  - hybrid
+  - attention_score
+  - causal_credits
+  - causal_no_uncertainty_penalty
+  - causal_high_uncertainty_penalty
+  - causal_recovery_all
+  - causal_anchor_floor
+  - causal_niah_guarded
+  - causal_niah_guarded_v2
+  - causal_niah_retrieval_balanced
+  - causal_query_bonus
+  - causal_two_stage
+  - h2o_like
+  - streaming_sink_like
+
+# ---------------------------------------------------------------------------
+# Memory budgets  (fraction of full KV cache capacity)
+# ---------------------------------------------------------------------------
+memory_budgets:
+  - id: budget_tight
+    fraction: 0.25
+    label: "25% capacity"
+  - id: budget_medium
+    fraction: 0.50
+    label: "50% capacity"
+  - id: budget_full
+    fraction: 0.75
+    label: "75% capacity"
+
+# ---------------------------------------------------------------------------
+# Sequence-length regimes
+# ---------------------------------------------------------------------------
+sequence_regimes:
+  - id: short
+    max_tokens: 2048
+    label: "Short (≤2 K)"
+  - id: medium
+    max_tokens: 8192
+    label: "Medium (≤8 K)"
+  - id: long
+    max_tokens: 32768
+    label: "Long (≤32 K)"
+
+# ---------------------------------------------------------------------------
+# Tasks
+# ---------------------------------------------------------------------------
+tasks:
+  - id: lcqa
+    name: "Long-Context QA"
+    description: "Open-domain question answering over long passages"
+    split: "validation"
+  - id: retrieval
+    name: "Long-Context Retrieval"
+    description: "Needle-in-a-haystack and passage retrieval"
+    split: "validation"
+  - id: doc_reasoning
+    name: "Document Reasoning"
+    description: "Multi-hop reasoning over long documents"
+    split: "validation"
+  - id: niah
+    name: "Needle-In-A-Haystack"
+    description: "Exact-match retrieval of a planted needle span"
+    split: "validation"
+
+# ---------------------------------------------------------------------------
+# External benchmark-ready slices (proxy wiring for reproducible runner flags)
+# NOTE: Marked as proxy-only until integrated with true LongBench/SCROLLS eval.
+# ---------------------------------------------------------------------------
+external_benchmark_slices:
+  - id: longbench_proxy_narrativeqa_retrieval_v1
+    suite: longbench_proxy
+    benchmark_task_name: narrativeqa
+    proxy_mode: true
+    notes: "Proxy path; replace with canonical LongBench scoring for paper claims."
+    defaults:
+      task: retrieval
+      regime: long
+      budget: budget_medium
+      seed: 42
+    policies:
+      - lru
+      - h2o_like
+      - causal_credits
+      - causal_niah_guarded
+      - causal_niah_guarded_v2
+      - causal_niah_retrieval_balanced
+  - id: longbench_narrativeqa_retrieval_v1
+    suite: longbench
+    benchmark_task_name: narrativeqa
+    proxy_mode: false
+    notes: "Non-proxy scaffold path; requires --enable-nonproxy-benchmark and --benchmark-data-path."
+    defaults:
+      task: retrieval
+      regime: long
+      budget: budget_medium
+      seed: 42
+    policies:
+      - lru
+      - h2o_like
+      - causal_credits
+      - causal_niah_guarded
+      - causal_niah_guarded_v2
+      - causal_niah_retrieval_balanced
+
+# ---------------------------------------------------------------------------
+# Required metric fields (enforced by validate_run_log.py)
+# Must match TPU.PerformanceFailureCondition and TPU.DeploymentAndRunLogging
+# ---------------------------------------------------------------------------
+required_metrics:
+  performance:
+    - tokens_per_sec
+    - decode_step_ms_mean
+    - decode_p99_latency_ms
+  cache:
+    - cache_hit_rate
+    - eviction_count
+    - refetch_count
+  policy:
+    - policy_inference_latency_ms   # null allowed for heuristic policies
+  run_context:
+    - config_hash
+    - seed
+    - chip_count
+    - topology
+    - benchmark_model_backend
+    - benchmark_model_id
+    - benchmark_bridge_mode
+    - benchmark_bridge_rows_scored
+  quality:
+    - task_quality_score
+    - benchmark_metric_name
+    - niah_exact_match
+    - compilation_cache_warm
+
+# ---------------------------------------------------------------------------
+# Baselines required for comparison (delta must be computed vs lru)
+# ---------------------------------------------------------------------------
+comparison_baseline: lru
