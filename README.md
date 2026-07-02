@@ -9,7 +9,7 @@ Canonical URL referenced in the paper:
 
 ## What is here
 
-This repository contains the **paper-scoped** slice of the CFKVE project:
+This repository contains the paper-scoped slice of the CFKVE project:
 
 - JAX inference + KV eviction policies under a globally capped decode-time harness
 - Structural prefix/suffix protection wrapper
