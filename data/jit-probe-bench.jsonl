@@ -1,0 +1,6 @@
+{"prompt": "What is the code?", "context": "The project identifier is CODE-ZETA-991. Use only this label.", "answer": "CODE-ZETA-991"}
+{"prompt": "What is the count?", "context": "The registered total is exactly 404 units.", "answer": "404"}
+{"prompt": "What is the city?", "context": "The headquarters city is listed as Metroburg.", "answer": "Metroburg"}
+{"prompt": "What is the voltage?", "context": "The nominal rail voltage is 3.3 volts.", "answer": "3.3 volts"}
+{"prompt": "What is the batch ID?", "context": "Manufacturing batch identifier: LOT-88-K.", "answer": "LOT-88-K"}
+{"prompt": "What is the offset?", "context": "The calibration offset in millimeters is 0.75.", "answer": "0.75"}

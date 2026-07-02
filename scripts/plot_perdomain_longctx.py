@@ -21,14 +21,14 @@ REPO = Path(__file__).resolve().parent.parent
 RESULTS = REPO / "results" / "longctx"
 OUT = REPO / "figures" / "fig_perdomain_longctx.pdf"
 
-# longbench-longctx.jsonl: 8 items per subtask in this order
+# longbench-longctx.jsonl: 8 items per subtask in file order (see data/longbench-longctx.jsonl `dataset` field)
 DOMAINS = [
     "2WikiMQA",
-    "MuSiQue",
-    "MultifieldQA",
     "HotPotQA",
-    "NarrativeQA",
+    "MultifieldQA",
     "Qasper",
+    "NarrativeQA",
+    "MuSiQue",
 ]
 
 
@@ -76,12 +76,12 @@ def main() -> None:
         color="#55A868",
     )
 
-    hotpot_i = DOMAINS.index("HotPotQA")
-    pct = prot["HotPotQA"] / full["HotPotQA"] * 100
+    hotpot_i = DOMAINS.index("NarrativeQA")
+    pct = prot["NarrativeQA"] / full["NarrativeQA"] * 100
     ax.annotate(
         f"{pct:.0f}% of ceiling\n(prot. > full cache)",
-        xy=(hotpot_i + width, prot["HotPotQA"]),
-        xytext=(hotpot_i + 0.35, min(0.78, prot["HotPotQA"] + 0.10)),
+        xy=(hotpot_i + width, prot["NarrativeQA"]),
+        xytext=(hotpot_i + 0.35, min(0.78, prot["NarrativeQA"] + 0.10)),
         fontsize=11,
         ha="center",
         arrowprops=dict(arrowstyle="->", lw=1.0),

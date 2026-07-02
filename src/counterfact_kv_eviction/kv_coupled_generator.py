@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, List, Sequence
+from typing import Any, Dict, List, Sequence, Tuple
 
 import numpy as np
+import time
 
 from .interfaces import KVBlockMetadata, KVPolicy
-from .policies import AdaKVFaithfulPolicy, QUESTFaithfulPolicy
+from .policies import AdaKVFaithfulPolicy, LRUPolicy, QUESTFaithfulPolicy
 
 
 @dataclass
@@ -40,6 +41,29 @@ class KVCoupledGeneratorResult:
     faithful_union_retained_max: int = 0
     faithful_union_overflow_max: int = 0
     faithful_union_overflow_steps: int = 0
+    policy_compute_time_s: float = 0.0
+    prefill_wall_s: float = 0.0
+    decode_phase_wall_s: float = 0.0
+    decode_step_n: int = 0
+    decode_step_mean_ms: float = 0.0
+    decode_step_p50_ms: float = 0.0
+    decode_step_p95_ms: float = 0.0
+    decode_step_p99_ms: float = 0.0
+
+
+def _decode_step_percentiles_ms(step_times_ms: List[float]) -> Tuple[int, float, float, float, float]:
+    """Return (n_steps, mean_ms, p50_ms, p95_ms, p99_ms) for one generation's decode forwards."""
+    if not step_times_ms:
+        return 0, 0.0, 0.0, 0.0, 0.0
+    a = np.asarray(step_times_ms, dtype=np.float64)
+    n = int(a.size)
+    return (
+        n,
+        float(np.mean(a)),
+        float(np.percentile(a, 50)),
+        float(np.percentile(a, 95)),
+        float(np.percentile(a, 99)),
+    )
 
 
 def position_meta_to_block(position_meta: KVPositionMetadata) -> KVBlockMetadata:
@@ -68,16 +92,29 @@ class KVCoupledQwen35Generator:
         capacity: int,
         evict_every_n_steps: int = 8,
         n_kv_heads: int = 0,
+        eviction_regime: str = "decode",
     ) -> None:
+        """Initialise the generator.
+
+        Args:
+            eviction_regime: When to apply the eviction policy.
+                ``'decode'`` (default) — evicts after prefill *and* at each
+                ``evict_every_n_steps`` decode step (existing behaviour).
+                ``'prefill'`` — evicts once after prefill only; no decode-time
+                eviction.  Matches PagedAttention / SnapKV reference semantics.
+        """
         if capacity <= 0:
             raise ValueError("capacity must be > 0")
         if evict_every_n_steps <= 0:
             raise ValueError("evict_every_n_steps must be > 0")
+        if eviction_regime not in {"decode", "prefill"}:
+            raise ValueError("eviction_regime must be 'decode' or 'prefill'")
         self.model = model
         self.tokenizer = tokenizer
         self.policy = policy
         self.capacity = int(capacity)
         self.evict_every_n_steps = int(evict_every_n_steps)
+        self.eviction_regime = eviction_regime
         # Detect per-head mode through wrapper (e.g. ProtectedPolicyWrapper)
         _inner = getattr(policy, 'inner', policy)
         self._per_head_mode = isinstance(_inner, (AdaKVFaithfulPolicy, QUESTFaithfulPolicy))
@@ -93,6 +130,7 @@ class KVCoupledQwen35Generator:
                 self._prefix_protect = max(4, int(cap * policy.prefix_frac))
             if getattr(policy, 'suffix_frac', 0) > 0:
                 self._suffix_protect = max(4, int(cap * policy.suffix_frac))
+        self._orig_prompt_len = 0  # set in generate_with_kv_control
 
     def generate_with_kv_control(
         self,
@@ -116,16 +154,28 @@ class KVCoupledQwen35Generator:
         faithful_union_retained_max = 0
         faithful_union_overflow_max = 0
         faithful_union_overflow_steps = 0
+        self._policy_time_s = 0.0
+        _decode_step_ms: List[float] = []
 
+        _t_prefill0 = time.perf_counter()
+        # LRU policy uses only recency (insert_step/last_access_step), not
+        # attention scores.  Skip output_attentions to avoid allocating the
+        # full [n_layers, n_q_heads, chunk, max_cache_len] tensor (~10GB/device
+        # on v5e at 33K context), which causes OOM on 16GB-HBM chips.
+        _inner_policy = getattr(self.policy, "inner", self.policy)  # unwrap ProtectedPolicyWrapper
+        _need_attn = not isinstance(_inner_policy, LRUPolicy)
         prefill_output = self.model(
             input_ids=list(input_ids),
-            output_attentions=True,
+            output_attentions=_need_attn,
             use_cache=True,
         )
+        prefill_wall_s = time.perf_counter() - _t_prefill0
+        _t_after_prefill = time.perf_counter()
         past_key_values = getattr(prefill_output, "past_key_values", None)
         prefill_scores = _attention_max_per_key(getattr(prefill_output, "attentions", None))
 
         n_prefill = len(input_ids)
+        self._orig_prompt_len = n_prefill  # Track original prompt for static suffix protection
         for pos, token_id in enumerate(input_ids):
             score = prefill_scores[pos] if pos < len(prefill_scores) else 0.0
             position_metadata.append(
@@ -187,11 +237,97 @@ class KVCoupledQwen35Generator:
                 policy_call_steps=policy_call_steps,
                 force_if_over_capacity=True,
             )
-            # Sync newly-evicted positions to _retention_float and per-head mask
-            for pos in positions_evicted[_prev_evict_count:]:
-                _retention_float[pos] = 0.0
-                if _per_head_retention is not None:
-                    _per_head_retention[:, pos] = False
+        else:
+            # ── Per-head post-prefill eviction (AdaKV / QUEST) ──────────────
+            # Mirrors the global _maybe_evict(step=0, force_if_over_capacity=True)
+            # path.  Runs for BOTH eviction_regime values when n_prefill exceeds
+            # capacity.  The decode-loop per-head call stays gated on
+            # eviction_regime == "decode" (see decode loop below).
+            if n_prefill > self.capacity and _per_head_retention is not None:
+                # Seed per-head signal arrays from prefill attention output.
+                _prefill_attn_raw = getattr(prefill_output, "attentions", None)
+                if _prefill_attn_raw is not None and len(_prefill_attn_raw) > 0:
+                    _ph_arr = np.asarray(_prefill_attn_raw[0], dtype=np.float32)
+                    if _ph_arr.ndim == 2:
+                        # (H, n_prefill) — compact per-head format from jax bridge
+                        _ph_hh = min(_ph_arr.shape[0],
+                                     _per_head_cumul.shape[0] if _per_head_cumul is not None else 0)
+                        _ph_cc = min(_ph_arr.shape[1], n_prefill)
+                    elif _ph_arr.ndim == 4:
+                        # (batch, H, q_len, k_len) — standard HuggingFace format;
+                        # use last query position's attention as per-head signal.
+                        _ph_arr = _ph_arr[0, :, -1, :]  # (H, k_len)
+                        _ph_hh = min(_ph_arr.shape[0],
+                                     _per_head_cumul.shape[0] if _per_head_cumul is not None else 0)
+                        _ph_cc = min(_ph_arr.shape[1], n_prefill)
+                    else:
+                        _ph_hh, _ph_cc = 0, 0
+                    if _ph_hh > 0 and _ph_cc > 0:
+                        if _per_head_cumul is not None:
+                            _per_head_cumul[:_ph_hh, :_ph_cc] += _ph_arr[:_ph_hh, :_ph_cc]
+                        if _per_head_current is not None:
+                            _per_head_current[:_ph_hh, :_ph_cc] = _ph_arr[:_ph_hh, :_ph_cc]
+                            _per_head_current_ready = _ph_cc > 0
+                _has_ph_signal = (
+                    (_per_head_cumul is not None and not self._per_head_uses_current)
+                    or (_per_head_current is not None
+                        and self._per_head_uses_current
+                        and _per_head_current_ready)
+                )
+                if _has_ph_signal:
+                    _policy_t0 = time.perf_counter()
+                    per_head_signal = (
+                        _per_head_current if self._per_head_uses_current else _per_head_cumul
+                    )
+                    ph_mask = self._per_head_policy.select_per_head_retention(
+                        per_head_signal[:, :n_prefill],
+                        retention_mask,
+                        self.capacity,
+                        n_protected=self._prefix_protect,
+                        n_suffix_protected=self._suffix_protect,
+                        orig_prompt_len=self._orig_prompt_len,
+                    )
+                    union_mask = ph_mask.any(axis=0)
+                    union_retained = int(union_mask.sum())
+                    faithful_union_retained_max = max(
+                        faithful_union_retained_max, union_retained)
+                    union_overflow = max(0, union_retained - self.capacity)
+                    faithful_union_overflow_max = max(
+                        faithful_union_overflow_max, union_overflow)
+                    if union_overflow > 0:
+                        faithful_union_overflow_steps += 1
+                    # ── Overflow guardrail (same logic as decode-loop per-head) ──
+                    if union_retained > self.capacity:
+                        _prot = np.zeros(n_prefill, dtype=bool)
+                        _prot[:self._prefix_protect] = True
+                        if self._suffix_protect > 0:
+                            _ret_arr = np.array(retention_mask[:n_prefill], dtype=bool)
+                            _ret_pos = np.where(_ret_arr)[0]
+                            if len(_ret_pos) >= self._suffix_protect:
+                                _prot[_ret_pos[-self._suffix_protect:]] = True
+                        _evict_cand = np.where(union_mask & ~_prot)[0]
+                        if len(_evict_cand) > 0:
+                            _votes = ph_mask[:, _evict_cand].sum(axis=0).astype(
+                                np.float64)
+                            _attn = per_head_signal[:, _evict_cand].sum(axis=0)
+                            _order = np.lexsort((_attn, _votes))
+                            _n_trim = min(union_retained - self.capacity,
+                                          len(_evict_cand))
+                            _trim_idx = _evict_cand[_order[:_n_trim]]
+                            union_mask[_trim_idx] = False
+                            ph_mask[:, _trim_idx] = False
+                    _per_head_retention[:, :n_prefill] = ph_mask
+                    for pos in range(n_prefill):
+                        if retention_mask[pos] and not union_mask[pos]:
+                            retention_mask[pos] = False
+                            positions_evicted.append(pos)
+                    policy_call_steps.append(0)
+                    self._policy_time_s += (time.perf_counter() - _policy_t0)
+        # Sync newly-evicted positions to _retention_float and per-head mask
+        for pos in positions_evicted[_prev_evict_count:]:
+            _retention_float[pos] = 0.0
+            if _per_head_retention is not None:
+                _per_head_retention[:, pos] = False
         _prev_evict_count = len(positions_evicted)
         retained_counts_by_step.append(_retained_count(retention_mask))
 
@@ -237,12 +373,14 @@ class KVCoupledQwen35Generator:
             if (
                 self._per_head_mode
                 and should_call_policy
+                and self.eviction_regime == "decode"
                 and _per_head_retention is not None
                 and (
                     (_per_head_cumul is not None and not self._per_head_uses_current)
                     or (_per_head_current is not None and self._per_head_uses_current and _per_head_current_ready)
                 )
             ):
+                _policy_t0 = time.perf_counter()
                 n_pos = len(position_metadata)
                 per_head_signal = _per_head_current if self._per_head_uses_current else _per_head_cumul
                 ph_mask = self._per_head_policy.select_per_head_retention(
@@ -251,6 +389,7 @@ class KVCoupledQwen35Generator:
                     self.capacity,
                     n_protected=self._prefix_protect,
                     n_suffix_protected=self._suffix_protect,
+                    orig_prompt_len=self._orig_prompt_len,
                 )
                 # Global retention = union of all heads' retention
                 union_mask = ph_mask.any(axis=0)
@@ -291,7 +430,8 @@ class KVCoupledQwen35Generator:
                         retention_mask[pos] = False
                         positions_evicted.append(pos)
                 policy_call_steps.append(step)
-            else:
+                self._policy_time_s += (time.perf_counter() - _policy_t0)
+            elif self.eviction_regime == "decode":
                 self._maybe_evict(
                     step=step,
                     position_metadata=position_metadata,
@@ -311,13 +451,22 @@ class KVCoupledQwen35Generator:
             if step == max_new_tokens:
                 break
 
-            # Build attention mask: per-head (2D ndarray) or global (1D list)
+            # Build attention mask: per-head (2D ndarray) or global (1D list).
+            # When n_kv_heads > 0, broadcast global retention to (H, n_pos) so the
+            # JAX adapter uses the same per-head decode JIT as Ada-KV/QUEST faithful.
+            # A 1D mask alone selects a different compiled specialization; wall-clock
+            # decode-step timing would not be comparable (LRU looked artificially slower).
             if self._per_head_mode and _per_head_retention is not None:
                 n_pos = len(position_metadata)
                 _attn_mask_arg = _per_head_retention[:, :n_pos].astype(np.float32)
+            elif self._n_kv_heads > 0:
+                n_pos = len(position_metadata)
+                rf = np.asarray(_retention_float[:n_pos], dtype=np.float32)
+                _attn_mask_arg = np.broadcast_to(rf, (self._n_kv_heads, n_pos)).copy()
             else:
                 _attn_mask_arg = _retention_float
 
+            _t_dec0 = time.perf_counter()
             decode_output = self.model(
                 input_ids=[next_token_id],
                 past_key_values=past_key_values,
@@ -325,6 +474,7 @@ class KVCoupledQwen35Generator:
                 output_attentions=True,
                 use_cache=True,
             )
+            _decode_step_ms.append((time.perf_counter() - _t_dec0) * 1000.0)
             past_key_values = getattr(decode_output, "past_key_values", past_key_values)
             last_logits = np.asarray(getattr(decode_output, "logits"))
 
@@ -369,6 +519,10 @@ class KVCoupledQwen35Generator:
         if self.tokenizer is not None and hasattr(self.tokenizer, "decode"):
             generated_text = str(self.tokenizer.decode(generated_ids))
 
+        decode_phase_wall_s = time.perf_counter() - _t_after_prefill
+
+        _ds_n, _ds_m, _ds_p50, _ds_p95, _ds_p99 = _decode_step_percentiles_ms(_decode_step_ms)
+
         return KVCoupledGeneratorResult(
             generated_token_ids=generated_ids,
             generated_text=generated_text,
@@ -382,6 +536,14 @@ class KVCoupledQwen35Generator:
             faithful_union_retained_max=faithful_union_retained_max,
             faithful_union_overflow_max=faithful_union_overflow_max,
             faithful_union_overflow_steps=faithful_union_overflow_steps,
+            policy_compute_time_s=float(self._policy_time_s),
+            prefill_wall_s=float(prefill_wall_s),
+            decode_phase_wall_s=float(decode_phase_wall_s),
+            decode_step_n=int(_ds_n),
+            decode_step_mean_ms=float(_ds_m),
+            decode_step_p50_ms=float(_ds_p50),
+            decode_step_p95_ms=float(_ds_p95),
+            decode_step_p99_ms=float(_ds_p99),
         )
 
     def _maybe_evict(
@@ -412,7 +574,9 @@ class KVCoupledQwen35Generator:
                 self.policy.name,
                 step,
             )
+        _policy_t0 = time.perf_counter()
         selected = self.policy.select_evictions(blocks=blocks, evict_count=evict_count, step=step)
+        self._policy_time_s += (time.perf_counter() - _policy_t0)
         policy_call_steps.append(step)
 
         for key in selected:

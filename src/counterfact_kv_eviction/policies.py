@@ -67,6 +67,117 @@ def _attention_signal(block: KVBlockMetadata) -> float:
     return float(max(block.attention_score, block.max_attention_score))
 
 
+def _build_retained_and_protected_mask(
+    retention_mask: List[bool],
+    n_positions: int,
+    n_protected: int = 0,
+    n_suffix_protected: int = 0,
+    *,
+    static_suffix_mode: bool = False,
+    orig_prompt_len: int = 0,
+) -> tuple[np.ndarray, np.ndarray]:
+    retained = np.array(retention_mask[:n_positions], dtype=bool)
+    protected = np.zeros(n_positions, dtype=bool)
+    protected[:n_protected] = True
+    if n_suffix_protected > 0:
+        if static_suffix_mode and orig_prompt_len > 0:
+            suffix_start = max(0, orig_prompt_len - n_suffix_protected)
+            suffix_end = min(n_positions, orig_prompt_len)
+            if suffix_end > suffix_start:
+                protected[suffix_start:suffix_end] = True
+        else:
+            retained_positions = np.where(retained)[0]
+            if len(retained_positions) > 0:
+                protected[retained_positions[-n_suffix_protected:]] = True
+    return retained, protected & retained
+
+
+def _allocate_adakv_head_budgets(
+    head_attn: np.ndarray,
+    budget_per_head: int,
+    *,
+    native_per_head: bool,
+) -> np.ndarray:
+    n_kv_heads = head_attn.shape[0]
+    if budget_per_head <= 0 or n_kv_heads <= 0:
+        return np.zeros(n_kv_heads, dtype=int)
+    if native_per_head:
+        return np.full(n_kv_heads, budget_per_head, dtype=int)
+
+    evictable_budget = budget_per_head * n_kv_heads
+    row_sums = head_attn.sum(axis=1, keepdims=True)
+    row_sums = np.maximum(row_sums, 1e-12)
+    probs = head_attn / row_sums
+
+    log_probs = np.log(np.maximum(probs, 1e-12))
+    entropy = -np.sum(probs * log_probs, axis=1)
+
+    inv_entropy = 1.0 / np.maximum(entropy, 1e-6)
+    budget_fracs = inv_entropy / inv_entropy.sum()
+    budgets = np.round(budget_fracs * evictable_budget).astype(int)
+
+    budgets = np.maximum(budgets, 1)
+    while budgets.sum() > evictable_budget:
+        largest_h = np.argmax(budgets)
+        budgets[largest_h] -= 1
+    while budgets.sum() < evictable_budget:
+        smallest_h = np.argmin(budgets)
+        budgets[smallest_h] += 1
+    return budgets
+
+
+def _select_adakv_per_head_retention(
+    per_head_cumul_attn: np.ndarray,
+    retention_mask: List[bool],
+    capacity: int,
+    n_protected: int = 0,
+    n_suffix_protected: int = 0,
+    *,
+    static_suffix_mode: bool = False,
+    orig_prompt_len: int = 0,
+    native_per_head: bool,
+) -> np.ndarray:
+    n_kv_heads, n_positions = per_head_cumul_attn.shape
+    result = np.zeros((n_kv_heads, n_positions), dtype=bool)
+
+    retained, protected = _build_retained_and_protected_mask(
+        retention_mask,
+        n_positions,
+        n_protected=n_protected,
+        n_suffix_protected=n_suffix_protected,
+        static_suffix_mode=static_suffix_mode,
+        orig_prompt_len=orig_prompt_len,
+    )
+    for h in range(n_kv_heads):
+        result[h] = protected
+
+    budget_per_head = max(0, int(capacity) - int(protected.sum()))
+    if budget_per_head <= 0:
+        return result
+
+    evictable_indices = np.where(retained & ~protected)[0]
+    if len(evictable_indices) == 0:
+        return result
+
+    head_attn = per_head_cumul_attn[:, evictable_indices]
+    budgets = _allocate_adakv_head_budgets(
+        head_attn,
+        budget_per_head,
+        native_per_head=native_per_head,
+    )
+
+    for h in range(n_kv_heads):
+        scores = per_head_cumul_attn[h, evictable_indices]
+        b_h = min(int(budgets[h]), len(evictable_indices))
+        if b_h >= len(evictable_indices):
+            result[h, evictable_indices] = True
+            continue
+        top_k_local = np.argpartition(scores, -b_h)[-b_h:]
+        result[h, evictable_indices[top_k_local]] = True
+
+    return result
+
+
 @dataclass
 class LRUPolicy:
     name: str = "lru"
@@ -1351,6 +1462,7 @@ class QUESTFaithfulPolicy:
     """
 
     name: str = "quest_faithful"
+    static_suffix_mode: bool = False  # If True, pin suffix to original prompt boundary
 
     def _keep_score(self, block: KVBlockMetadata) -> float:
         return float(block.attention_score)
@@ -1376,8 +1488,14 @@ class QUESTFaithfulPolicy:
         capacity: int,
         n_protected: int = 0,
         n_suffix_protected: int = 0,
+        orig_prompt_len: int = 0,
     ) -> np.ndarray:
-        """Return per-head retention mask from the latest per-head attention."""
+        """Return per-head retention mask from the latest per-head attention.
+
+        Suffix protection modes:
+        - Dynamic (default): protects highest-numbered retained positions (may migrate during generation)
+        - Static: protects fixed positions in range [orig_prompt_len - n_suffix_protected, orig_prompt_len)
+        """
         n_kv_heads, n_positions = per_head_attn.shape
         result = np.zeros((n_kv_heads, n_positions), dtype=bool)
 
@@ -1385,10 +1503,18 @@ class QUESTFaithfulPolicy:
         protected = np.zeros(n_positions, dtype=bool)
         protected[:n_protected] = True
         if n_suffix_protected > 0:
-            retained_positions = np.where(retained)[0]
-            if len(retained_positions) > 0:
-                for p in retained_positions[-n_suffix_protected:]:
-                    protected[p] = True
+            if self.static_suffix_mode and orig_prompt_len > 0:
+                # Static suffix: pin to original prompt boundary
+                suffix_start = max(0, orig_prompt_len - n_suffix_protected)
+                suffix_end = min(n_positions, orig_prompt_len)
+                if suffix_end > suffix_start:
+                    protected[suffix_start:suffix_end] = True
+            else:
+                # Dynamic suffix: highest-numbered retained positions (original behavior)
+                retained_positions = np.where(retained)[0]
+                if len(retained_positions) > 0:
+                    for p in retained_positions[-n_suffix_protected:]:
+                        protected[p] = True
 
         for h in range(n_kv_heads):
             result[h] = protected & retained
@@ -1411,6 +1537,18 @@ class QUESTFaithfulPolicy:
             result[h, evictable_indices[top_k_local]] = True
 
         return result
+
+
+@dataclass
+class QUESTNativePolicy(QUESTFaithfulPolicy):
+    """Explicit native per-head QUEST variant for side-by-side experiments.
+
+    The faithful QUEST selector already applies a full per-head
+    `capacity - protected_count` budget, so this class is a named alias with
+    identical retention semantics.
+    """
+
+    name: str = "quest_native"
 
 
 @dataclass
@@ -1453,6 +1591,7 @@ class AdaKVFaithfulPolicy:
     """
 
     name: str = "adakv_faithful"
+    static_suffix_mode: bool = False  # If True, pin suffix to original prompt boundary
 
     def select_evictions(
         self,
@@ -1475,6 +1614,7 @@ class AdaKVFaithfulPolicy:
         capacity: int,
         n_protected: int = 0,
         n_suffix_protected: int = 0,
+        orig_prompt_len: int = 0,
     ) -> np.ndarray:
         """Return per-head retention mask: (n_kv_heads, n_positions) bool array.
 
@@ -1483,73 +1623,50 @@ class AdaKVFaithfulPolicy:
         2. Allocate budgets: B_h proportional to 1/entropy_h (concentrated heads get more)
         3. Each head keeps its top-B_h by cumul_attn among non-protected retained positions
         4. Protected positions (prefix and suffix) are always retained in all heads
+
+        Suffix protection modes:
+        - Dynamic (default): protects highest-numbered retained positions (may migrate during generation)
+        - Static: protects fixed positions in range [orig_prompt_len - n_suffix_protected, orig_prompt_len)
         """
-        n_kv_heads, n_positions = per_head_cumul_attn.shape
-        result = np.zeros((n_kv_heads, n_positions), dtype=bool)
+        return _select_adakv_per_head_retention(
+            per_head_cumul_attn,
+            retention_mask,
+            capacity,
+            n_protected=n_protected,
+            n_suffix_protected=n_suffix_protected,
+            static_suffix_mode=self.static_suffix_mode,
+            orig_prompt_len=orig_prompt_len,
+            native_per_head=False,
+        )
 
-        # Identify retained and protected positions
-        retained = np.array(retention_mask[:n_positions], dtype=bool)
-        protected = np.zeros(n_positions, dtype=bool)
-        protected[:n_protected] = True  # prefix protection
-        # Suffix protection: highest-numbered retained positions
-        if n_suffix_protected > 0:
-            retained_positions = np.where(retained)[0]
-            if len(retained_positions) > 0:
-                for p in retained_positions[-n_suffix_protected:]:
-                    protected[p] = True
 
-        # Protected positions are always kept in all heads
-        for h in range(n_kv_heads):
-            result[h] = protected & retained
+@dataclass
+class AdaKVNativePolicy(AdaKVFaithfulPolicy):
+    """Closer-to-native per-head Ada-KV comparison variant.
 
-        # Repo-wide capacity semantics are "retained tokens" for the model.
-        # In a standard cache that means each KV head stores up to `capacity`
-        # token positions, so the equivalent faithful per-head budget is the
-        # sum of per-head slots: capacity * n_kv_heads.
-        protected_count = int(protected.sum())
-        evictable_budget = max(0, (capacity - protected_count) * n_kv_heads)
-        if evictable_budget <= 0:
-            return result
+    Uses the same cumulative-attention signal and shared protection as the
+    faithful variant, but gives every head the full unprotected per-head budget
+    instead of redistributing a shared cross-head budget by entropy.
+    """
 
-        # Evictable positions: retained AND not protected
-        evictable_mask = retained & ~protected
-        evictable_indices = np.where(evictable_mask)[0]
-        if len(evictable_indices) == 0:
-            return result
+    name: str = "adakv_native"
 
-        # Compute per-head entropy from cumulative attention over evictable positions
-        head_attn = per_head_cumul_attn[:, evictable_indices]  # (H, N_evictable)
-        row_sums = head_attn.sum(axis=1, keepdims=True)
-        row_sums = np.maximum(row_sums, 1e-12)
-        probs = head_attn / row_sums  # (H, N_evictable)
-
-        # Shannon entropy per head
-        log_probs = np.log(np.maximum(probs, 1e-12))
-        entropy = -np.sum(probs * log_probs, axis=1)  # (H,)
-
-        # Budget allocation: B_h proportional to 1/H_h (concentrated → larger budget)
-        inv_entropy = 1.0 / np.maximum(entropy, 1e-6)
-        budget_fracs = inv_entropy / inv_entropy.sum()
-        budgets = np.round(budget_fracs * evictable_budget).astype(int)
-
-        # Ensure every head gets at least 1, redistribute from largest if needed
-        budgets = np.maximum(budgets, 1)
-        while budgets.sum() > evictable_budget:
-            largest_h = np.argmax(budgets)
-            budgets[largest_h] -= 1
-        while budgets.sum() < evictable_budget:
-            smallest_h = np.argmin(budgets)
-            budgets[smallest_h] += 1
-
-        # Each head retains its top-B_h positions by cumulative attention
-        for h in range(n_kv_heads):
-            scores = per_head_cumul_attn[h, evictable_indices]
-            b_h = min(int(budgets[h]), len(evictable_indices))
-            if b_h >= len(evictable_indices):
-                # Keep all evictable positions for this head
-                result[h, evictable_indices] = True
-            else:
-                top_k_local = np.argpartition(scores, -b_h)[-b_h:]
-                result[h, evictable_indices[top_k_local]] = True
-
-        return result
+    def select_per_head_retention(
+        self,
+        per_head_cumul_attn: np.ndarray,
+        retention_mask: List[bool],
+        capacity: int,
+        n_protected: int = 0,
+        n_suffix_protected: int = 0,
+        orig_prompt_len: int = 0,
+    ) -> np.ndarray:
+        return _select_adakv_per_head_retention(
+            per_head_cumul_attn,
+            retention_mask,
+            capacity,
+            n_protected=n_protected,
+            n_suffix_protected=n_suffix_protected,
+            static_suffix_mode=self.static_suffix_mode,
+            orig_prompt_len=orig_prompt_len,
+            native_per_head=True,
+        )

@@ -1,7 +1,9 @@
 .venv/
 __pycache__/
-*.pyc
+*.py[cod]
+*.egg-info/
 .DS_Store
-*.jsonl
-*.jsonl.gz
-results/
+*.log
+*.tmp
+.pytest_cache/
+.mypy_cache/

@@ -20,13 +20,41 @@ Design goals:
 
 from __future__ import annotations
 
+from functools import partial
 import json
 import math
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Sequence
 
 import numpy as np
+
+try:
+    import ml_dtypes
+except ImportError:
+    ml_dtypes = None  # type: ignore[assignment]
+
+
+def _ensure_numpy_float8_compat() -> None:
+    """Expose float8 dtypes on numpy when provided by ml_dtypes.
+
+    Some safetensors builds resolve float8 symbols from numpy directly.
+    Older numpy builds in TPU images may miss these attributes.
+    """
+    if ml_dtypes is None:
+        return
+    for name in (
+        "float8_e4m3fn",
+        "float8_e4m3fnuz",
+        "float8_e5m2",
+        "float8_e5m2fnuz",
+    ):
+        if not hasattr(np, name) and hasattr(ml_dtypes, name):
+            setattr(np, name, getattr(ml_dtypes, name))
+
+
+_ensure_numpy_float8_compat()
 
 try:
     import jax
@@ -85,6 +113,7 @@ class TransformerConfig:
     query_pre_attn_scalar: float = 0  # >0: use this instead of head_dim for attn scale
     gemma_embed_scale: bool = False  # multiply embeddings by sqrt(hidden_size)
     gemma3_layer_attn_types: tuple[str, ...] | None = None  # per-layer "sliding"/"global"
+    gemma3_sliding_window: int | None = None
     gemma3_local_rope_theta: float = 10000.0
     gemma3_global_rope_theta: float = 1000000.0
     gemma3_global_rope_factor: float = 8.0  # linear position scaling for global layers
@@ -180,10 +209,19 @@ class TransformerConfig:
                 query_pre_attn_scalar=float(tc.get("query_pre_attn_scalar", tc_head_dim)),
                 gemma_embed_scale=True,
                 gemma3_layer_attn_types=g3_layer_types if g3_layer_types else None,
+                gemma3_sliding_window=int(tc.get("sliding_window", 1024)),
                 gemma3_local_rope_theta=local_theta,
                 gemma3_global_rope_theta=global_theta,
                 gemma3_global_rope_factor=global_factor,
             )
+
+        # Mistral3/Ministral3 wrap text config inside text_config.
+        # Reuse the existing mistral/llama implementation for text-only decoding.
+        if model_type in ("mistral3", "ministral3") and "text_config" in cfg:
+            cfg = cfg["text_config"]
+            model_type = cfg.get("model_type", "mistral")
+            if model_type in ("mistral3", "ministral3"):
+                model_type = "mistral"
 
         # Qwen3.5 wraps text config inside text_config
         if model_type == "qwen3_5" and "text_config" in cfg:
@@ -309,9 +347,10 @@ class TransformerConfig:
                 rope_short_factor=short_factor,
                 original_max_position_embeddings=orig_max_pos,
             )
-        elif model_type in ("llama", "mistral"):
+        elif model_type in ("llama", "mistral", "ministral"):
             # Parse rope_scaling for llama3 / linear / etc.
-            rope_scaling = cfg.get("rope_scaling") or {}
+            # Mistral3 commonly uses rope_parameters with the same keys.
+            rope_scaling = cfg.get("rope_scaling") or cfg.get("rope_parameters") or {}
             rope_type = rope_scaling.get("rope_type") or rope_scaling.get("type")
             rs_factor = float(rope_scaling.get("factor", 1.0))
             rs_low_freq = float(rope_scaling.get("low_freq_factor", 1.0))
@@ -326,7 +365,7 @@ class TransformerConfig:
                 num_key_value_heads=cfg.get("num_key_value_heads", n_heads),
                 num_hidden_layers=cfg["num_hidden_layers"],
                 rms_norm_eps=cfg.get("rms_norm_eps", 1e-5),
-                rope_theta=cfg.get("rope_theta", 500000.0),
+                rope_theta=cfg.get("rope_theta", rope_scaling.get("rope_theta", 500000.0)),
                 head_dim=head_dim,
                 tie_word_embeddings=cfg.get("tie_word_embeddings", True),
                 max_position_embeddings=cfg.get("max_position_embeddings", 131072),
@@ -371,8 +410,9 @@ def _load_all_safetensors(model_dir: Path) -> dict[str, Any]:
         for i, shard in enumerate(shards, 1):
             print(f"  [shard {i}/{n_shards}] {shard.name}", flush=True)
             params.update(load_file(str(shard)))
-    except TypeError:
-        # bf16 weights — numpy can't handle them, load as JAX arrays directly
+    except (TypeError, AttributeError):
+        # bf16/float8 weights or older numpy dtype support gaps.
+        # Load as JAX arrays directly via flax path.
         from safetensors import safe_open
         params = {}
         for i, shard in enumerate(shards, 1):
@@ -459,21 +499,53 @@ def load_model(model_dir: str | Path) -> tuple[TransformerConfig, dict[str, Any]
 # ─── Tensor parallelism ──────────────────────────────────────────────────────
 
 def create_tp_mesh(tp_size: int | None = None) -> Mesh | None:
-    """Create a 1D mesh for tensor parallelism across local devices.
+    """Create a 1D tensor-parallel mesh.
 
-    On multi-host TPU pod slices, uses only the local host's devices
-    so each worker can run independently.
+    Preference order:
+     1) Local-host mesh when tp_size fits on this host.
+         This avoids multi-host device_put validation traffic for param loading.
+     2) Balanced multi-host global mesh when tp_size exceeds local devices and
+         can be split evenly across processes.
 
-    Returns None if tp_size is None or 1 (single-device mode).
+    Returns None if tp_size is None or <= 1.
     """
     if tp_size is None or tp_size <= 1:
         return None
-    devices = jax.local_devices()
-    if len(devices) < tp_size:
-        raise ValueError(
-            f"Requested tp_size={tp_size} but only {len(devices)} local devices available"
-        )
-    return Mesh(np.array(devices[:tp_size]), axis_names=("tp",))
+
+    local_devices = list(jax.local_devices())
+    global_devices = list(jax.devices())
+    process_count = jax.process_count()
+
+    # Prefer local mesh whenever possible. In distributed runs this keeps
+    # sharding fully addressable on each host and avoids multi-host allgather
+    # during device_put for large parameter tensors.
+    if len(local_devices) >= tp_size:
+        return Mesh(np.array(local_devices[:tp_size]), axis_names=("tp",))
+
+    if process_count > 1 and tp_size % process_count == 0:
+        per_process = tp_size // process_count
+        if per_process > 0 and len(local_devices) >= per_process:
+            by_process: dict[int, list[Any]] = {}
+            for d in global_devices:
+                by_process.setdefault(int(d.process_index), []).append(d)
+
+            selected: list[Any] = []
+            ok = True
+            for p in range(process_count):
+                proc_devs = sorted(by_process.get(p, []), key=lambda d: int(d.id))
+                if len(proc_devs) < per_process:
+                    ok = False
+                    break
+                selected.extend(proc_devs[:per_process])
+
+            if ok and len(selected) == tp_size:
+                return Mesh(np.array(selected), axis_names=("tp",))
+
+    raise ValueError(
+        "Requested tp_size="
+        f"{tp_size} but only {len(local_devices)} local devices are available; "
+        "multi-host balanced mesh setup was not possible"
+    )
 
 
 def _shard_weight(
@@ -485,6 +557,13 @@ def _shard_weight(
     Row-parallel (shard axis 1): O/down projections
     Replicated: embeddings, norms, lm_head, DeltaNet scalars
     """
+    ndim = int(getattr(param, "ndim", 0))
+
+    # Some checkpoints include scalar auxiliary tensors (e.g. per-tensor scales).
+    # These should always be replicated.
+    if ndim == 0:
+        return jax.device_put(param, NamedSharding(mesh, P()))
+
     # Determine sharding based on parameter name suffix
     if any(s in name for s in (
         "q_proj.weight", "k_proj.weight", "v_proj.weight",
@@ -494,23 +573,23 @@ def _shard_weight(
         "in_proj_qkv.weight", "in_proj_z.weight",
     )):
         # Column-parallel: shard output dimension (axis 0)
-        spec = P("tp", None) if param.ndim == 2 else P("tp")
+        spec = P("tp", None) if ndim >= 2 else P("tp")
     elif any(s in name for s in (
         "q_proj.bias", "k_proj.bias", "v_proj.bias",
     )):
         # Bias for column-parallel projections
-        spec = P("tp")
+        spec = P("tp") if ndim == 1 else P(*([None] * ndim))
     elif any(s in name for s in (
         "o_proj.weight", "down_proj.weight",
         # DeltaNet: row-parallel output projection
         "out_proj.weight",
     )):
         # Row-parallel: shard reduction dimension (axis 1)
-        spec = P(None, "tp")
+        spec = P(None, "tp") if ndim >= 2 else P(*([None] * ndim))
     else:
         # Everything else is replicated: embed, norms, lm_head,
         # DeltaNet small tensors (A_log, dt_bias, conv1d, in_proj_a, in_proj_b)
-        spec = P(*([None] * param.ndim))
+        spec = P(*([None] * ndim))
 
     return jax.device_put(param, NamedSharding(mesh, spec))
 
@@ -562,14 +641,21 @@ def longrope_rotary_embedding(
     x: Any, positions: Any, head_dim: int, theta: float,
     long_factor: tuple[float, ...], short_factor: tuple[float, ...],
     original_max_position_embeddings: int, max_position_embeddings: int,
+    partial_rotary_factor: float = 1.0,
 ) -> Any:
     """Apply LongRoPE (SuRoPE) to x. x shape: (batch, n_heads, seq_len, head_dim).
 
     Phi-3.5 uses per-dimension frequency scaling factors that differ for
     short (≤ original_max_pos) and long (> original_max_pos) sequences.
     The factor divides inv_freq, effectively stretching the period.
+
+    When partial_rotary_factor < 1.0 (e.g. Phi-4-mini at 0.75), only the
+    first rotary_dim dimensions get RoPE; the rest pass through unchanged.
+    The long/short factors have length rotary_dim/2, not head_dim/2.
     """
-    half = head_dim // 2
+    rot_dim = int(head_dim * partial_rotary_factor)
+    rot_dim = rot_dim - (rot_dim % 2)  # ensure even
+    half = rot_dim // 2
     freq_exponents = jnp.arange(0, half, dtype=jnp.float32) / half
     inv_freq = 1.0 / (theta ** freq_exponents)  # (half,)
 
@@ -590,9 +676,14 @@ def longrope_rotary_embedding(
     cos = jnp.cos(angles).astype(x.dtype)
     sin = jnp.sin(angles).astype(x.dtype)
 
-    x1 = x[..., :half]
-    x2 = x[..., half:]
-    return jnp.concatenate([x1 * cos - x2 * sin, x2 * cos + x1 * sin], axis=-1)
+    x_rot = x[..., :rot_dim]
+    x_pass = x[..., rot_dim:]
+    x1 = x_rot[..., :half]
+    x2 = x_rot[..., half:]
+    x_rot = jnp.concatenate([x1 * cos - x2 * sin, x2 * cos + x1 * sin], axis=-1)
+    if partial_rotary_factor >= 1.0:
+        return x_rot
+    return jnp.concatenate([x_rot, x_pass], axis=-1)
 
 
 def llama3_rotary_embedding(
@@ -836,6 +927,7 @@ def _attention_layer(
     norm_residual_weight: bool = False,
     query_pre_attn_scalar: float = 0,
     rms_norm_eps: float = 1e-6,
+    sliding_window: int | None = None,
 ) -> tuple[Any, Any, Any, Any | None]:
     """Single-layer attention with static-shape KV cache.
 
@@ -890,11 +982,13 @@ def _attention_layer(
             q, positions, head_dim, rope_theta,
             rope_long_factor, rope_short_factor,
             original_max_position_embeddings, max_position_embeddings,
+            partial_rotary_factor,
         )
         k = longrope_rotary_embedding(
             k, positions, head_dim, rope_theta,
             rope_long_factor, rope_short_factor,
             original_max_position_embeddings, max_position_embeddings,
+            partial_rotary_factor,
         )
     elif rope_scaling_type == "llama3" and original_max_position_embeddings > 0:
         q = llama3_rotary_embedding(
@@ -930,6 +1024,20 @@ def _attention_layer(
             'bkgsd,bkcd->bkgsc', q_grouped, cache_k) * scale
         # Flatten groups → (B, n_heads, S, C) for mask + softmax
         attn_weights = attn_weights.reshape(batch, n_heads, seq_len, cache_len)
+        if sliding_window is not None and sliding_window > 0:
+            key_pos = jnp.arange(cache_len, dtype=jnp.int32)
+            if seq_len == 1:
+                # Decode: current query index equals cache_pos.
+                q_pos = jnp.asarray(cache_pos, dtype=jnp.int32)
+                sw_valid = key_pos >= (q_pos - sliding_window + 1)
+                sw_mask = jnp.where(sw_valid, 0.0, -1e9).astype(jnp.float32)
+                attn_weights = attn_weights + sw_mask[None, None, None, :]
+            else:
+                # Prefill: query indices are [cache_pos, ..., cache_pos + seq_len - 1].
+                q_pos = jnp.arange(seq_len, dtype=jnp.int32) + jnp.asarray(cache_pos, dtype=jnp.int32)
+                sw_valid = key_pos[None, :] >= (q_pos[:, None] - sliding_window + 1)
+                sw_mask = jnp.where(sw_valid, 0.0, -1e9).astype(jnp.float32)
+                attn_weights = attn_weights + sw_mask[None, None, :, :]
         attn_weights = attn_weights + mask
         attn_weights_f32 = jax.nn.softmax(attn_weights.astype(jnp.float32), axis=-1)
         # V matmul in grouped form (keep float32 V for numerical stability)
@@ -942,6 +1050,18 @@ def _attention_layer(
             batch, n_heads, seq_len, head_dim).astype(jnp.bfloat16)
     else:
         attn_weights = (q @ cache_k.transpose(0, 1, 3, 2)) * scale
+        if sliding_window is not None and sliding_window > 0:
+            key_pos = jnp.arange(cache_len, dtype=jnp.int32)
+            if seq_len == 1:
+                q_pos = jnp.asarray(cache_pos, dtype=jnp.int32)
+                sw_valid = key_pos >= (q_pos - sliding_window + 1)
+                sw_mask = jnp.where(sw_valid, 0.0, -1e9).astype(jnp.float32)
+                attn_weights = attn_weights + sw_mask[None, None, None, :]
+            else:
+                q_pos = jnp.arange(seq_len, dtype=jnp.int32) + jnp.asarray(cache_pos, dtype=jnp.int32)
+                sw_valid = key_pos[None, :] >= (q_pos[:, None] - sliding_window + 1)
+                sw_mask = jnp.where(sw_valid, 0.0, -1e9).astype(jnp.float32)
+                attn_weights = attn_weights + sw_mask[None, None, :, :]
         attn_weights = attn_weights + mask
         attn_weights_f32 = jax.nn.softmax(attn_weights.astype(jnp.float32), axis=-1)
         # Keep float32 through the V matmul to preserve long-tail attention weights
@@ -1169,6 +1289,15 @@ def _forward_jittable(
                 norm_residual_weight=config.norm_residual_weight,
                 query_pre_attn_scalar=config.query_pre_attn_scalar,
                 rms_norm_eps=config.rms_norm_eps,
+                sliding_window=(
+                    config.gemma3_sliding_window
+                    if (
+                        config.gemma3_layer_attn_types is not None
+                        and i < len(config.gemma3_layer_attn_types)
+                        and config.gemma3_layer_attn_types[i] == "sliding"
+                    )
+                    else None
+                ),
             )
             if config.sandwich_norm:
                 attn_out = rms_norm(attn_out, lp["post_attention_layernorm.weight"], config.rms_norm_eps, residual_weight=config.norm_residual_weight)
@@ -1296,7 +1425,7 @@ class JAXModelAdapter:
 
         if is_hybrid:
             # Hybrid model: donate KV cache (args 1,2) and DeltaNet state (args 5,6)
-            @jax.jit(donate_argnums=(1, 2, 5, 6))
+            @partial(jax.jit, donate_argnums=(1, 2, 5, 6))
             def step_fn(token_ids, cache_keys, cache_values, cache_pos, mask,
                         recurrent_states, conv_states,
                         embed_w, lm_head_w, final_norm_w, layer_params):
@@ -1310,7 +1439,7 @@ class JAXModelAdapter:
                 )
         else:
             # Standard model: donate KV cache (args 1,2)
-            @jax.jit(donate_argnums=(1, 2))
+            @partial(jax.jit, donate_argnums=(1, 2))
             def step_fn(token_ids, cache_keys, cache_values, cache_pos, mask,
                         embed_w, lm_head_w, final_norm_w, layer_params):
                 return _forward_jittable(
@@ -1795,13 +1924,35 @@ def load_jax_model_and_tokenizer(
     # Convert to JAX arrays. When TP is active, shard directly from numpy
     # to avoid placing 27B+ model entirely on a single device (OOM).
     if mesh is not None:
+        disable_mh_assert = False
+        if os.environ.get("CFKVE_DISABLE_MH_ASSERT_EQUAL", "0") == "1":
+            if jax.process_count() > 1:
+                local_proc = int(jax.process_index())
+                mesh_devs = list(mesh.devices.flat)
+                disable_mh_assert = any(int(d.process_index) != local_proc for d in mesh_devs)
+
+        mh_mod = None
+        mh_assert_orig = None
+        if disable_mh_assert:
+            # JAX device_put on multi-host sharding validates host inputs with
+            # process allgather. For large params this can OOM before sharding.
+            # In this code path each host reads identical checkpoint shards.
+            from jax.experimental import multihost_utils as _mh  # local import to limit scope
+            mh_mod = _mh
+            mh_assert_orig = _mh.assert_equal
+            _mh.assert_equal = lambda *args, **kwargs: None
+
         print(f"[JAX] Sharding {len(text_params)} params across {effective_tp} devices ...")
         params = {}
-        for k, v in text_params.items():
-            sharded = _shard_weight(
-                jnp.asarray(v, dtype=jnp.bfloat16), k, config, mesh)
-            params[k] = sharded
-            del v, sharded  # free numpy + intermediate immediately
+        try:
+            for k, v in text_params.items():
+                sharded = _shard_weight(
+                    jnp.asarray(v, dtype=jnp.bfloat16), k, config, mesh)
+                params[k] = sharded
+                del v, sharded  # free numpy + intermediate immediately
+        finally:
+            if mh_mod is not None and mh_assert_orig is not None:
+                mh_mod.assert_equal = mh_assert_orig
         del text_params
         print(f"[JAX] Sharding complete")
     else:

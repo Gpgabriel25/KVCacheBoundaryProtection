@@ -286,102 +286,12 @@ def fig_protection_sensitivity(outdir: Path):
     print(f"Saved: {out}")
 
 
-def fig_protection_lift_bar(outdir: Path):
-    """Bar chart showing protection lift across models and policies."""
-    if not HAS_MPL:
-        return
-    
-    fig, ax = plt.subplots(figsize=(10.8, 4.2))
-    
-    # Data: (label, no_prot, with_prot) at c256
-    groups = [
-        ('Q-3B\nLRU', 0.011, 0.282),
-        ('Q-3B\nH2O', 0.038, 0.290),
-        ('Q-3B\nSnapKV', 0.038, 0.290),
-        ('Q-3B\nStreamLLM', 0.027, 0.184),
-        ('Q-1.5B\nLRU', 0.012, 0.241),
-        ('Q-1.5B\nH2O', None, 0.231),
-        ('Q-1.5B\nSnapKV', None, 0.231),
-    ]
-    
-    # Add Phi-3.5 groups if data available
-    if PHI35.get('lru_prot', {}).get(256) is not None:
-        phi_lru_np = PHI35.get('lru_noprot', {}).get(256)
-        phi_lru_p = PHI35['lru_prot'][256]
-        groups.append(('Phi-3.5\nLRU', phi_lru_np, phi_lru_p))
-        if PHI35.get('h2o_prot', {}).get(256) is not None:
-            groups.append(('Phi-3.5\nH2O', None, PHI35['h2o_prot'][256]))
-        if PHI35.get('snapkv_prot', {}).get(256) is not None:
-            groups.append(('Phi-3.5\nSnapKV', None, PHI35['snapkv_prot'][256]))
-
-    # Add Qwen-7B groups if data available
-    if Q7B.get('lru_prot', {}).get(256) is not None:
-        q7b_lru_np = Q7B.get('lru_noprot', {}).get(256)
-        q7b_lru_p = Q7B['lru_prot'][256]
-        groups.append(('Q-7B\nLRU', q7b_lru_np, q7b_lru_p))
-        if Q7B.get('h2o_prot', {}).get(256) is not None:
-            groups.append(('Q-7B\nH2O', None, Q7B['h2o_prot'][256]))
-        if Q7B.get('snapkv_prot', {}).get(256) is not None:
-            groups.append(('Q-7B\nSnapKV', None, Q7B['snapkv_prot'][256]))
-    
-    x = np.arange(len(groups))
-    width = 0.35
-    
-    noprot_vals = [g[1] if g[1] is not None else 0 for g in groups]
-    prot_vals = [g[2] for g in groups]
-    labels = [g[0] for g in groups]
-    
-    bars1 = ax.bar(x - width/2, noprot_vals, width, label='No protection', 
-                   color='#d62728', alpha=0.7, edgecolor='white')
-    bars2 = ax.bar(x + width/2, prot_vals, width, label='With protection (10%)',
-                   color='#2ca02c', alpha=0.7, edgecolor='white')
-    
-    # Add full-cache lines with model boundaries
-    q3b_end = 3.5 / len(groups)
-    q15_end = 6.5 / len(groups)
-    phi_end = 1.0
-    
-    ax.axhline(Q3B['fullcache'], color='#1f77b4', ls=':', alpha=0.5, xmin=0, xmax=q3b_end)
-    ax.axhline(Q15B['fullcache'], color='#1f77b4', ls=':', alpha=0.5, xmin=q3b_end, xmax=q15_end)
-    ax.text(1.5, Q3B['fullcache'] + 0.005, 'Q-3B ceil', fontsize=9, color='#1f77b4', alpha=0.7)
-    ax.text(5.0, Q15B['fullcache'] + 0.005, 'Q-1.5B ceil', fontsize=9, color='#1f77b4', alpha=0.7)
-    
-    if PHI35['fullcache'] is not None and len(groups) > 7:
-        ax.axhline(PHI35['fullcache'], color='#1f77b4', ls=':', alpha=0.5, xmin=q15_end, xmax=phi_end)
-        ax.text(len(groups) - 1.5, PHI35['fullcache'] + 0.005, 'Phi-3.5 ceil', fontsize=9, color='#1f77b4', alpha=0.7)
-    
-    # Add improvement labels
-    for i, (label, np_val, p_val) in enumerate(groups):
-        if np_val is not None and np_val > 0:
-            ratio = p_val / np_val
-            ax.text(i + width/2, p_val + 0.005, f'{ratio:.0f}\u00d7', 
-                    ha='center', fontsize=9, fontweight='bold', color='#2ca02c')
-    
-    ax.set_xticks(x)
-    ax.set_xticklabels(labels, fontsize=10)
-    ax.set_ylabel('Token F1 ($C{=}256$)', fontsize=12)
-    ax.set_ylim(0, 0.36)
-    ax.legend(fontsize=10.5, loc='upper left')
-    ax.grid(True, alpha=0.3, axis='y')
-    
-    # Vertical separators between models
-    ax.axvline(3.5, color='gray', ls='-', alpha=0.3)
-    ax.axvline(6.5, color='gray', ls='-', alpha=0.3)
-    
-    fig.tight_layout()
-    out = outdir / 'fig_protection_lift.pdf'
-    fig.savefig(out, bbox_inches='tight', dpi=300)
-    plt.close(fig)
-    print(f"Saved: {out}")
-
-
 def main():
     outdir = Path('figures')
     outdir.mkdir(parents=True, exist_ok=True)
     
     fig_capacity_curve(outdir)
     fig_protection_sensitivity(outdir)
-    fig_protection_lift_bar(outdir)
     
     print(f"\nAll figures saved to {outdir}/")
 

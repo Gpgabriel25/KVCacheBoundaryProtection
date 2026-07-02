@@ -1,38 +1,106 @@
 # KVCacheBoundaryProtection
 
-Public artifacts for the paper **“Protection Is (Nearly) All You Need: Structural Protection Dominates Scoring in Globally Capped KV Eviction.”**
+Code and data for **Protection Is (Nearly) All You Need: Structural Protection Dominates Scoring in Globally Capped KV Eviction** ([arXiv:2605.18053](https://arxiv.org/abs/2605.18053)).
 
-This repository is meant to be **fork-friendly**: figures, plotting scripts, and a thin slice of the inference/policy code used in the study. The full private research checkout (large JSONL bundles, TPU runbooks, and experiment orchestration) stays internal.
+Gabriel Garcia (Independent Researcher).
+
+Canonical URL referenced in the paper:
+<https://github.com/gpgabriel25/KVCacheBoundaryProtection>
 
 ## What is here
 
-| Path | Purpose |
-|------|---------|
-| `figures/` | PDFs of every main-paper figure (same files shipped to arXiv). |
-| `scripts/` | Matplotlib scripts that regenerate those PDFs from summarized metrics or checked-in result files. |
-| `configs/` | YAML policy/matrix configs mirrored from the internal `release/` bundle. |
-| `src/counterfact_kv_eviction/` | Core Python modules for policies and JAX-side plumbing (subset of the internal package). |
-| `DATA_MANIFEST.md` | Where full per-item JSONL lives internally and how to regenerate plots if you have access. |
+This repository contains the **paper-scoped** slice of the CFKVE project:
 
-## Quick start (figures only)
+- JAX inference + KV eviction policies under a globally capped decode-time harness
+- Structural prefix/suffix protection wrapper
+- Online counterfactual credit estimator (negative result in Appendix)
+- Benchmark JSONL files used in the paper
+- Per-item result JSONL needed to regenerate all six main figures and key appendix tables
+- Matplotlib scripts that reproduce those figures
+
+See [`DATA_MANIFEST.md`](DATA_MANIFEST.md) for the complete file map.
+
+## Setup
 
 ```bash
 python3 -m venv .venv && source .venv/bin/activate
-pip install -r requirements-figures.txt
-python3 scripts/generate_figures.py
-python3 scripts/plot_context_scaling.py figures/
-python3 scripts/plot_f1_histogram.py
-python3 scripts/plot_64k_position.py --preset q3-4b-2507
-python3 scripts/plot_perdomain_longctx.py
+pip install -r requirements-release.txt
+pip install -e .
 ```
 
-Outputs land under `figures/` when you run commands from this repository root (paths were normalized for the public tree).
+For figure-only regeneration (no JAX/TPU):
 
-## Ethics / scope
+```bash
+pip install -r requirements-figures.txt
+```
 
-- Checkpoints are public Hugging Face models; see the paper’s model table for IDs and licenses.
-- This repo **does not** ship large raw JSONL dumps by default (bandwidth + privacy of aggregate-only release). Use `DATA_MANIFEST.md` if you are collaborating with the authors and need the exact artifact paths.
+## Regenerate all main-paper figures
+
+From the repository root:
+
+```bash
+python3 scripts/generate_figures.py
+python3 scripts/plot_f1_histogram.py
+python3 scripts/plot_context_scaling.py
+python3 scripts/plot_perdomain_longctx.py
+python3 scripts/plot_64k_position.py --preset q3-4b-2507
+```
+
+PDFs are written to `figures/`.
+
+## Run an experiment (TPU / JAX)
+
+```bash
+python3 scripts/run_v3_jax.py \
+  --model-id Qwen/Qwen2.5-3B-Instruct \
+  --data-path data/longbench-balanced.jsonl \
+  --policy lru \
+  --capacity 256 \
+  --output results/example/q25-c256-lru-prot.jsonl \
+  --max-cache-len 2048 \
+  --max-new-tokens 128 \
+  --protect-prefix-suffix \
+  --protect-frac 0.10
+```
+
+Policy names, capacities, and protection flags match the paper setup (§ Experimental Setup).
+Requires Cloud TPU + JAX with Hugging Face model weights.
+
+## Appendix utilities
+
+```bash
+# JAX decode-step latency table (Appendix tab:p99_jax)
+python3 scripts/aggregate_jax_decode_latency.py results/jit-latency-probe --min-idx 1 \
+  --latex paper/jax_decode_latency_table.tex
+
+# N=481 scale-up table (Table tab:cross_model_n481)
+python3 scripts/aggregate_n481.py results/n481 reports/n481-aggregate
+
+# ROUGE-L vs token-F1 on all bundled result JSONL
+python3 scripts/compute_rougel.py
+```
+
+`scripts/attention_mass_analysis_v2.py` reproduces the attention-mass pilot but
+requires a separate PyTorch + GPU environment (`pip install torch transformers`).
+
+## License
+
+Code is released under the [MIT License](LICENSE). Benchmark JSONL under
+`data/` is derived from public corpora; model checkpoints remain under their
+respective Hugging Face licenses (see paper Table `tab:models`).
 
 ## Citation
 
-Use the citation block from the arXiv page once the paper is live, or cite the NeurIPS preprint PDF metadata from `ArxivMetadata.md` in the private paper repository.
+If you use this code or build on these results, please cite:
+
+```bibtex
+@misc{garcia2026protectionnearlyneedstructural,
+      title={Protection Is (Nearly) All You Need: Structural Protection Dominates Scoring in Globally Capped KV Eviction}, 
+      author={Gabriel Garcia},
+      year={2026},
+      eprint={2605.18053},
+      archivePrefix={arXiv},
+      primaryClass={cs.LG},
+      url={https://arxiv.org/abs/2605.18053}, 
+}
+```

@@ -1,0 +1,18 @@
+{
+  "model_id": "Qwen/Qwen2.5-3B-Instruct",
+  "policy": "lru",
+  "capacity": 4096,
+  "demotion_ratio": 0.0,
+  "evict_every": 8,
+  "max_new_tokens": 384,
+  "max_cache_len": 4096,
+  "data_path": "data/longbench-summarization.jsonl",
+  "scored": 40,
+  "token_f1": 0.378195,
+  "exact_match": 0.0,
+  "total_evictions": 0,
+  "total_tokens_generated": 7447,
+  "tokens_per_sec": 13.14,
+  "run_id": "summ-probe-fullcache",
+  "jax_backend": "tpu"
+}
